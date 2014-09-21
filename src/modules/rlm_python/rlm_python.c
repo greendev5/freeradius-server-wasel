@@ -52,6 +52,8 @@ struct py_function_def {
 
 typedef struct rlm_python_t {
 	PyThreadState *main_thread_state;
+	char *virtualenv;
+	char *pythonpath;
 	struct py_function_def
 	instantiate,
 	authorize,
@@ -79,6 +81,8 @@ typedef struct rlm_python_t {
  *	buffer over-flows.
  */
 static CONF_PARSER module_config[] = {
+	{ "virtualenv", PW_TYPE_STRING_PTR, offsetof(rlm_python_t, virtualenv), NULL, NULL},
+	{ "pythonpath", PW_TYPE_STRING_PTR, offsetof(rlm_python_t, pythonpath), NULL, NULL},
 
 #define A(x) { "mod_" #x, PW_TYPE_STRING_PTR, offsetof(rlm_python_t, x.module_name), NULL, NULL }, \
 	{ "func_" #x, PW_TYPE_STRING_PTR, offsetof(rlm_python_t, x.function_name), NULL, NULL },
@@ -175,6 +179,32 @@ static PyMethodDef radiusd_methods[] = {
 };
 
 
+static void python_add_path(const char *pythonpath)
+{
+	PyObject *sys_path; 
+	PyObject *path; 
+	size_t len, i, prev_i;
+
+	if (!strlen(pythonpath))
+		return;
+
+	sys_path = PySys_GetObject("path"); 
+	if (sys_path == NULL) 
+		return; 
+
+	for (i = prev_i = 0; i <= strlen(pythonpath); i++) {
+		if ((pythonpath[i] == ';') || (pythonpath[i] == '\0')) {
+			len = i - prev_i;
+			if (len > 0) {
+				path = PyString_FromStringAndSize(pythonpath + prev_i, len);
+				if (path)
+					PyList_Append(sys_path, path);
+			}
+			prev_i = i + 1;
+		}
+	}
+}
+
 static void python_error(void)
 {
 	PyObject
@@ -207,12 +237,31 @@ static int python_init(rlm_python_t *inst)
 {
 	int i;
 	static char name[] = "radiusd";
+	static char *argv[] = {"radiusd"};
 
 	if (radiusd_module) return 0;
 
 	Py_SetProgramName(name);
+	if (inst->virtualenv) {
+		radlog(L_DBG, "Setting virtualenv to %s", inst->virtualenv);
+		Py_SetPythonHome(inst->virtualenv);
+		radlog(L_DBG, "Done setting virtualenv");
+	} else {
+		radlog(L_DBG, "No virtualenv in settings");
+	}
 #ifdef HAVE_PTHREAD_H
+	/* Maybe it should be before HAVE_PTHREAD_H */
 	Py_InitializeEx(0);				/* Don't override signal handlers */
+	if (inst->pythonpath) {
+		radlog(L_DBG, "Setting pythonpath to %s", inst->pythonpath);
+		python_add_path(inst->pythonpath);
+		radlog(L_DBG, "Done setting pythonpath");
+	} else {
+		radlog(L_DBG, "No pythonpath in settings");
+	}
+	PySys_SetArgv(1, argv);
+	/***/
+
 	PyEval_InitThreads(); 				/* This also grabs a lock */
 	inst->main_thread_state = PyThreadState_Get();	/* We need this for setting up thread local stuff */
 #endif
@@ -663,16 +712,16 @@ static int python_instantiate(CONF_SECTION *conf, void **instance)
 		return -1;
 	memset(data, 0, sizeof(*data));
 
-	if (python_init(data) != 0) {
-		free(data);
-		return -1;
-	}
-
 	/*
 	 *      If the configuration parameters can't be parsed, then
 	 *      fail.
 	 */
 	if (cf_section_parse(conf, data, module_config) < 0) {
+		free(data);
+		return -1;
+	}
+
+	if (python_init(data) != 0) {
 		free(data);
 		return -1;
 	}

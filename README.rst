@@ -1,3 +1,12 @@
+Description about freeradius-server-wasel
+=====================
+This branch of freeradius-server 2.2.5 contains my changes for
+better integration with python code.
+
+1. Added virtualenv option to rlm_python.
+2. Added pythonpath option to rlm_python.
+3. Added rlm_pap_pbkdf2 - new module for PAP auth with PBKDF2 hashing.
+
 The FreeRADIUS server
 =====================
 |BuildStatus|_

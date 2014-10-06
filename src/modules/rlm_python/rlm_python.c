@@ -55,6 +55,7 @@ typedef struct rlm_python_t {
 	char *virtualenv;
 	char *pythonpath;
 	struct py_function_def
+	load_clients,
 	instantiate,
 	authorize,
 	authenticate,
@@ -87,6 +88,7 @@ static CONF_PARSER module_config[] = {
 #define A(x) { "mod_" #x, PW_TYPE_STRING_PTR, offsetof(rlm_python_t, x.module_name), NULL, NULL }, \
 	{ "func_" #x, PW_TYPE_STRING_PTR, offsetof(rlm_python_t, x.function_name), NULL, NULL },
 
+  A(load_clients)
   A(instantiate)
   A(authorize)
   A(authenticate)
@@ -178,6 +180,53 @@ static PyMethodDef radiusd_methods[] = {
 	{ NULL, NULL, 0, NULL },
 };
 
+static int python_add_radius_client(const char *ipaddr, const char *shortname, const char *nastype, const char *secret)
+{
+	RADCLIENT *c;
+
+	c = rad_malloc(sizeof(*c));
+	memset(c, 0, sizeof(*c));
+
+#ifdef WITH_DYNAMIC_CLIENTS
+	c->dynamic = 1;
+#endif
+
+	if (ip_hton(ipaddr, AF_UNSPEC, &c->ipaddr) < 0) {
+		radlog(L_CONS|L_ERR, "rlm_python: Failed to look up hostname %s: %s", ipaddr, fr_strerror());
+		free(c);
+		return;
+	} else {
+		char buffer[256];
+		ip_ntoh(&c->ipaddr, buffer, sizeof(buffer));
+		c->longname = strdup(buffer);
+	}
+
+	switch (c->ipaddr.af) {
+	case AF_INET:
+		c->prefix = 32;
+		break;
+	case AF_INET6:
+		c->prefix = 128;
+		break;
+	default:
+		break;
+	}
+
+	c->shortname = strdup(shortname);
+	if (nastype != NULL)
+		c->nastype = strdup(nastype);
+	c->secret = strdup(secret);
+
+	radlog(L_DBG, "rlm_python: Adding client %s (%s) to clients list",
+		c->longname, c->shortname);
+
+	if (!client_add(NULL, c)) {
+		radlog(L_CONS|L_ERR, "rlm_python: Failed to add client %s (%s) to clients list.  Maybe there's a duplicate?",
+			c->longname, c->shortname);
+		client_free(c);
+	}
+
+}
 
 static void python_add_path(const char *pythonpath)
 {
@@ -261,6 +310,7 @@ static int python_init(rlm_python_t *inst)
 	}
 	PySys_SetArgv(1, argv);
 	/***/
+
 
 	PyEval_InitThreads(); 				/* This also grabs a lock */
 	inst->main_thread_state = PyThreadState_Get();	/* We need this for setting up thread local stuff */
@@ -607,6 +657,145 @@ finish:
 	return ret;
 }
 
+static int do_python_load_clients(rlm_python_t *inst, REQUEST *request, PyObject *pFunc, char const *funcname, int worker)
+{
+	VALUE_PAIR      *vp;
+	PyObject	*pRet = NULL;
+	PyObject	*pArgs = NULL;
+	int		tuplelen;
+	int		ret = RLM_MODULE_NOOP;
+	int i = 0;
+
+	PyGILState_STATE gstate;
+	PyThreadState	*prev_thread_state = NULL;	/* -Wuninitialized */
+	memset(&gstate, 0, sizeof(gstate));		/* -Wuninitialized */
+
+	/* Return with "OK, continue" if the function is not defined. */
+	if (!pFunc)
+		return RLM_MODULE_NOOP;
+
+
+#ifdef HAVE_PTHREAD_H
+	gstate = PyGILState_Ensure();
+	if (worker) {
+		PyThreadState *my_thread_state;
+		my_thread_state = fr_thread_local_init(local_thread_state, do_python_cleanup);
+		if (!my_thread_state) {
+			my_thread_state = PyThreadState_New(inst->main_thread_state->interp);
+			if (!my_thread_state) {
+				radlog(L_ERR, "Failed initialising local PyThreadState on first run");
+				PyGILState_Release(gstate);
+				return RLM_MODULE_FAIL;
+			}
+
+			ret = fr_thread_local_set(local_thread_state, my_thread_state);
+			if (ret != 0) {
+				radlog(L_ERR, "Failed storing PyThreadState in TLS: %s", strerror(ret));
+				PyThreadState_Clear(my_thread_state);
+				PyThreadState_Delete(my_thread_state);
+				PyGILState_Release(gstate);
+				return RLM_MODULE_FAIL;
+			}
+		}
+		prev_thread_state = PyThreadState_Swap(my_thread_state);	/* Swap in our local thread state */
+	}
+#endif
+
+	/* Default return value is "OK, continue" */
+	ret = RLM_MODULE_OK;
+
+	/*
+	 *	We will pass a tuple containing (name, value) tuples
+	 *	We can safely use the Python function to build up a
+	 *	tuple, since the tuple is not used elsewhere.
+	 *
+	 *	Determine the size of our tuple by walking through the packet.
+	 *	If request is NULL, pass None.
+	 */
+	tuplelen = 0;
+	if (request != NULL) {
+		for (vp = request->packet->vps; vp; vp = vp->next)
+			tuplelen++;
+	}
+
+	if (tuplelen == 0) {
+		Py_INCREF(Py_None);
+		pArgs = Py_None;
+	} else {
+		int i = 0;
+		if ((pArgs = PyTuple_New(tuplelen)) == NULL) {
+			ret = RLM_MODULE_FAIL;
+			goto finish;
+		}
+
+		for (vp = request->packet->vps;
+		     vp != NULL;
+		     vp = vp->next, i++) {
+			PyObject *pPair;
+
+			/* The inside tuple has two only: */
+			if ((pPair = PyTuple_New(2)) == NULL) {
+				ret = RLM_MODULE_FAIL;
+				goto finish;
+			}
+
+			if (python_populate_vptuple(pPair, vp) == 0) {
+				/* Put the tuple inside the container */
+				PyTuple_SET_ITEM(pArgs, i, pPair);
+			} else {
+				Py_INCREF(Py_None);
+				PyTuple_SET_ITEM(pArgs, i, Py_None);
+				Py_DECREF(pPair);
+			}
+		}
+	}
+
+	/* Call Python function. */
+	pRet = PyObject_CallFunctionObjArgs(pFunc, pArgs, NULL);
+
+	if (!pRet) {
+		ret = RLM_MODULE_FAIL;
+		goto finish;
+	}
+
+	if (PyList_CheckExact(pRet)) {
+		PyObject *pTuple;
+
+		for (i = 0; i < PyList_Size(pRet); i++) {
+			pTuple = PyList_GET_ITEM(pRet, i);
+			if (PyTuple_CheckExact(pTuple)) {
+				if (PyTuple_GET_SIZE(pTuple) == 4) {
+					const char *s1, *s2, *s3, *s4;
+					s1 = PyString_AsString(PyTuple_GET_ITEM(pTuple, 0));
+					s2 = PyString_AsString(PyTuple_GET_ITEM(pTuple, 1));
+					s3 = PyString_AsString(PyTuple_GET_ITEM(pTuple, 2));
+					s4 = PyString_AsString(PyTuple_GET_ITEM(pTuple, 3));
+					python_add_radius_client(s1, s2, s3, s4);
+				}
+			}
+		}
+
+	} else {
+		/* Not tuple or None */
+		radlog(L_ERR, "rlm_python:%s: function did not return a list", funcname);
+		ret = RLM_MODULE_FAIL;
+		goto finish;
+	}
+
+finish:
+	Py_XDECREF(pArgs);
+	Py_XDECREF(pRet);
+
+#ifdef HAVE_PTHREAD_H
+	if (worker) {
+		PyThreadState_Swap(prev_thread_state);
+	}
+	PyGILState_Release(gstate);
+#endif
+
+	return ret;
+}
+
 /*
  *	Import a user module and load a function from it
  */
@@ -679,6 +868,7 @@ static void python_instance_clear(struct rlm_python_t *data)
 {
 #define A(x) python_funcdef_clear(&data->x)
 
+	A(load_clients);
 	A(instantiate);
 	A(authorize);
 	A(authenticate);
@@ -728,6 +918,7 @@ static int python_instantiate(CONF_SECTION *conf, void **instance)
 
 #define A(x) if (python_load_function(&data->x) < 0) goto failed
 
+	A(load_clients);
 	A(instantiate);
 	A(authenticate);
 	A(authorize);
@@ -751,6 +942,9 @@ static int python_instantiate(CONF_SECTION *conf, void **instance)
 	 *	Call the instantiate function.  No request.  Use the
 	 *	return value.
 	 */
+
+	do_python_load_clients(data, NULL, data->load_clients.function, "load_clients", 0);
+
 	return do_python(data, NULL, data->instantiate.function, "instantiate", 0);
  failed:
  	Pyx_BLOCK_THREADS

@@ -1,3 +1,9 @@
+freeradius (2.2.5-1~wasel) unstable; urgency=medium
+
+  * Added wasel code.
+
+ -- Illia Muzychuk <i.muzichuk@gmail.com>  Thu, 20 Mar 2013 11:34:00 +0100
+
 freeradius (2.2.5+git) unstable; urgency=medium
 
   * New upstream version.

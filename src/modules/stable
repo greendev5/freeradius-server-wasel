@@ -28,6 +28,7 @@ rlm_ns_mta_md5
 rlm_otp
 rlm_pam
 rlm_pap
+rlm_pap_pbkdf2
 rlm_passwd
 rlm_perl
 rlm_policy
